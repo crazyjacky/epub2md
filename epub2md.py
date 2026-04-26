@@ -16,6 +16,7 @@ import re
 import argparse
 import zipfile
 import shutil
+import posixpath
 from pathlib import Path
 from html.parser import HTMLParser
 
@@ -42,6 +43,17 @@ def _sanitize_block_id(raw: str) -> str:
     bid = re.sub(r'[^A-Za-z0-9\-]', '-', raw)
     bid = re.sub(r'-+', '-', bid).strip('-')
     return bid or "anchor"
+
+
+def _dedupe_preserve_order(values) -> list:
+    """按原始出现顺序去重，避免 set 打乱目录链接目标。"""
+    result = []
+    seen = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
 
 def _preprocess_anchors(soup):
@@ -104,10 +116,112 @@ def _get_block_refs(node) -> str:
     raw = node.get("data-block-ids", "")
     if not raw:
         return ""
-    ids = [_sanitize_block_id(x) for x in raw.split(",") if x.strip()]
+    ids = _dedupe_preserve_order(_sanitize_block_id(x) for x in raw.split(",") if x.strip())
     if not ids:
         return ""
     return " " + " ".join(f"^{x}" for x in ids)
+
+
+def _get_heading_refs(node) -> list:
+    """返回标题上原始 id 对应的块引用 id，保持原始顺序。"""
+    raw = node.get("data-heading-ids", "")
+    return _dedupe_preserve_order(_sanitize_block_id(x) for x in raw.split(",") if x.strip())
+
+
+def _compact_text(text: str) -> str:
+    """把 HTML 中的换行、制表符、多空格折叠成适合作为链接别名的一行文本。"""
+    return re.sub(r'\s+', ' ', text or '').strip()
+
+
+def _visible_text_with_inline_spacing(node) -> str:
+    """提取目录可见文本，只在块级/换行边界补空格，不拆散中文词。"""
+    if isinstance(node, NavigableString):
+        return str(node)
+    if not isinstance(node, Tag):
+        return ""
+    if node.name and node.name.lower() == "br":
+        return " "
+    BLOCK_TAGS = {"p", "div", "section", "article", "li", "ul", "ol", "nav",
+                  "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"}
+    parts = [_visible_text_with_inline_spacing(child) for child in node.children]
+    text = "".join(parts)
+    if node.name and node.name.lower() in BLOCK_TAGS:
+        return f" {text} "
+    return text
+
+
+def _nav_label_text(node) -> str:
+    """目录链接文本：保留原有 inline 串联，只折叠空白。"""
+    return _compact_text(_visible_text_with_inline_spacing(node))
+
+
+def _wiki_alias(text: str) -> str:
+    """清理 Obsidian 双链别名，避免中英文目录里的换行/方括号/竖线打断链接。"""
+    text = _compact_text(text)
+    return text.replace('[', '(').replace(']', ')').replace('|', '｜')
+
+
+def _markdown_link_label(text: str) -> str:
+    """清理普通 Markdown 链接文本。"""
+    text = _compact_text(text)
+    return text.replace('[', '\\[').replace(']', '\\]')
+
+
+def _is_placeholder_title(title: str) -> bool:
+    """判断是否为无法从正文推断出的占位章节名。"""
+    return bool(re.fullmatch(r'Chapter \d+', _compact_text(title or "")))
+
+
+def _stem_from_link_map(link_map: dict, key: str) -> str:
+    """从 link_map 取某个 EPUB 文件对应的 Markdown 文件 stem。"""
+    if not key:
+        return ""
+    return link_map.get(key + ":stem", "")
+
+
+def _first_entry_id_from_link_map(link_map: dict, key: str) -> str:
+    """从 link_map 取章节入口 id，供目录链接精确跳转章节开头。"""
+    ids = link_map.get(key + ":heading_ids", []) if key else []
+    return ids[0] if ids else ""
+
+
+def _normalize_epub_path(path: str) -> str:
+    """规范化 EPUB 内部 href/file_name，兼容 URL 编码、相对路径和 query。"""
+    from urllib.parse import unquote
+
+    if not path:
+        return ""
+    path = path.split("?", 1)[0]
+    path = unquote(path).replace("\\", "/").lstrip("/")
+    normalized = posixpath.normpath(path)
+    if normalized == ".":
+        return ""
+    return normalized.lstrip("./")
+
+
+def _href_candidates(file_part: str, base_href: str = "") -> list:
+    """生成 EPUB 内部链接可能对应的 key，包含相对当前文件解析后的路径。"""
+    from urllib.parse import unquote
+
+    candidates = []
+
+    def add(value):
+        if value and value not in candidates:
+            candidates.append(value)
+
+    raw = (file_part or "").split("?", 1)[0]
+    decoded = unquote(raw)
+    for value in (raw, decoded, _normalize_epub_path(raw), _normalize_epub_path(decoded)):
+        add(value)
+        add(os.path.basename(value))
+
+    if raw and base_href:
+        base_dir = posixpath.dirname(_normalize_epub_path(base_href))
+        resolved = _normalize_epub_path(posixpath.join(base_dir, decoded))
+        add(resolved)
+        add(os.path.basename(resolved))
+
+    return candidates
 
 
 def html_to_markdown(html_content: str, image_dir: str = None, base_href: str = "",
@@ -161,8 +275,7 @@ def _node_to_md(node, image_dir=None, base_href="", list_depth=0, ordered=False,
         if not inner:
             return ""
         # 从预处理时保留的 data-heading-ids 拿 id
-        heading_ids_raw = node.get("data-heading-ids", "")
-        ids = [_sanitize_block_id(x) for x in heading_ids_raw.split(",") if x.strip()]
+        ids = _get_heading_refs(node)
         # 块引用必须独占一行
         ref_lines = "\n\n" + " ".join(f"^{i}" for i in ids) if ids else ""
         return f"\n\n{'#' * level} {inner}{ref_lines}\n\n"
@@ -278,88 +391,7 @@ def _node_to_md(node, image_dir=None, base_href="", list_depth=0, ordered=False,
     if tag == "a":
         href = node.get("href", "")
         inner = children_md().strip()
-        if not inner:
-            return ""
-        if not href:
-            return inner
-
-        # 外部链接直接保留
-        if href.startswith(("http://", "https://", "mailto:")):
-            return f"[{inner}]({href})"
-
-        # epub 内部链接：解析文件名和锚点
-        if "#" in href:
-            file_part, anchor_part = href.rsplit("#", 1)
-        else:
-            file_part, anchor_part = href, ""
-
-        # 多种形式查找 link_map
-        from urllib.parse import unquote
-        target_title = ""
-        target_stem = ""
-        target_entry_ids = set()
-        target_sub_headings = {}
-        if file_part:
-            candidates = [
-                file_part,
-                unquote(file_part),
-                os.path.basename(file_part),
-                unquote(os.path.basename(file_part)),
-            ]
-            for cand in candidates:
-                if cand in link_map:
-                    target_title = link_map[cand]
-                    target_stem = link_map.get(cand + ":stem", "")
-                    target_entry_ids = link_map.get(cand + ":heading_ids", set())
-                    target_sub_headings = link_map.get(cand + ":sub_headings", {})
-                    break
-
-        # 判断锚点类型：
-        # - 章节入口 id → 整章链接
-        # - 子标题 id → 跳到子标题
-        # - 其他 → 块引用
-        anchor_is_chapter_entry = bool(anchor_part) and anchor_part in target_entry_ids
-        anchor_is_sub_heading = bool(anchor_part) and anchor_part in target_sub_headings
-        sub_heading_text = target_sub_headings.get(anchor_part, "") if anchor_is_sub_heading else ""
-
-        # 转义链接文本
-        safe_inner = inner.replace('[', '\\[').replace(']', '\\]')
-        wiki_inner = inner.replace('[', '(').replace(']', ')')
-
-        if single_file:
-            # 章节入口链接 → 用该章节第一个 heading id 作为块引用目标
-            if target_title and (not anchor_part or anchor_is_chapter_entry):
-                # 若有锚点且是章节入口 id，直接用；否则从 entry_ids 取第一个
-                if anchor_part:
-                    bid = _sanitize_block_id(anchor_part)
-                else:
-                    # 取 target_entry_ids 中第一个作为跳转目标
-                    bid = _sanitize_block_id(next(iter(target_entry_ids), target_title))
-                return f"[[#^{bid}|{wiki_inner}]]"
-            # 子标题 / 精确锚点 / 普通锚点 → 全部用块引用
-            if anchor_part:
-                bid = _sanitize_block_id(anchor_part)
-                return f"[[#^{bid}|{wiki_inner}]]"
-            if target_title:
-                bid = _sanitize_block_id(next(iter(target_entry_ids), target_title))
-                return f"[[#^{bid}|{wiki_inner}]]"
-            return inner
-        else:
-            # 分章模式
-            if target_stem:
-                # 章节入口 → 纯文件双链（跳到章节开头）
-                if not anchor_part or anchor_is_chapter_entry:
-                    if inner == target_title:
-                        return f"[[{target_stem}]]"
-                    return f"[[{target_stem}|{wiki_inner}]]"
-                # 其他锚点（子标题、表格等）→ 块引用
-                bid = _sanitize_block_id(anchor_part)
-                return f"[[{target_stem}#^{bid}|{wiki_inner}]]"
-            # 同文件内锚点
-            if anchor_part and not file_part:
-                bid = _sanitize_block_id(anchor_part)
-                return f"[[#^{bid}|{wiki_inner}]]"
-            return inner
+        return _convert_internal_href(href, inner, link_map, base_href, single_file) if inner else ""
 
     # ── 图片 ──
     if tag == "img":
@@ -486,6 +518,112 @@ def _table_to_md(table_tag) -> str:
     return "\n\n" + "\n".join(lines) + "\n\n"
 
 
+def _nav_points_to_lines(node, link_map: dict, base_href: str = "", single_file: bool = False,
+                         depth: int = 0) -> list:
+    """把 EPUB2 ncx/navPoint 目录转成 Markdown 列表。"""
+    lines = []
+    for nav_point in node.find_all("navpoint", recursive=False):
+        label = nav_point.find("text")
+        content = nav_point.find("content")
+        title = _nav_label_text(label) if label else ""
+        href = content.get("src", "") if content else ""
+        if title:
+            link = _convert_internal_href(href, title, link_map, base_href, single_file) if href else title
+            lines.append(f"{'  ' * depth}- {link}")
+        lines.extend(_nav_points_to_lines(nav_point, link_map, base_href, single_file, depth + 1))
+    return lines
+
+
+def nav_to_markdown(html_content: str, link_map: dict = None, base_href: str = "",
+                    single_file: bool = False) -> str:
+    """专门转换 EPUB nav / ncx 目录，避免目录被当成普通正文段落造成中英文错位。"""
+    soup = BeautifulSoup(html_content, "html.parser")
+    link_map = link_map or {}
+
+    nav_map = soup.find("navmap")
+    if nav_map:
+        lines = _nav_points_to_lines(nav_map, link_map, base_href, single_file)
+        return "\n".join(lines).strip()
+
+    nav = soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav", attrs={"type": "toc"}) or soup.find("nav")
+    if nav:
+        nav_copy = BeautifulSoup(str(nav), "html.parser")
+        for a in nav_copy.find_all("a"):
+            label = _nav_label_text(a)
+            converted = _convert_internal_href(a.get("href", ""), label, link_map, base_href, single_file)
+            a.clear()
+            a.append(converted)
+        return _node_to_md(nav_copy, base_href=base_href, link_map={},
+                           single_file=single_file).strip()
+
+    return html_to_markdown(html_content, base_href=base_href, link_map=link_map,
+                            single_file=single_file)
+
+
+def _convert_internal_href(href: str, label: str, link_map: dict, base_href: str = "",
+                           single_file: bool = False) -> str:
+    """把 EPUB 内部 href 转换为 Obsidian 双链，供 HTML <a> 和 ncx 目录共用。"""
+    if not href:
+        return _compact_text(label)
+
+    if href.startswith(("http://", "https://", "mailto:")):
+        return f"[{_markdown_link_label(label)}]({href})"
+
+    if "#" in href:
+        file_part, anchor_part = href.rsplit("#", 1)
+    else:
+        file_part, anchor_part = href, ""
+
+    anchor_part = anchor_part.strip()
+    anchor_bid = _sanitize_block_id(anchor_part) if anchor_part else ""
+    target_title = ""
+    target_stem = ""
+    target_entry_ids = []
+    target_sub_headings = {}
+    if file_part:
+        for cand in _href_candidates(file_part, base_href):
+            if cand in link_map:
+                target_title = link_map[cand]
+                target_stem = link_map.get(cand + ":stem", "")
+                target_entry_ids = link_map.get(cand + ":heading_ids", set())
+                target_sub_headings = link_map.get(cand + ":sub_headings", {})
+                break
+
+    target_entry_bids = _dedupe_preserve_order(_sanitize_block_id(x) for x in target_entry_ids)
+    anchor_is_chapter_entry = bool(anchor_part) and (
+        anchor_part in target_entry_ids or anchor_bid in target_entry_bids
+    )
+    wiki_label = _wiki_alias(label)
+
+    if single_file:
+        if target_title and (not anchor_part or anchor_is_chapter_entry):
+            if anchor_part:
+                return f"[[#^{anchor_bid}|{wiki_label}]]"
+            if target_entry_bids:
+                return f"[[#^{target_entry_bids[0]}|{wiki_label}]]"
+            return f"[[#{_compact_text(target_title)}|{wiki_label}]]"
+        if anchor_part:
+            return f"[[#^{anchor_bid}|{wiki_label}]]"
+        return _compact_text(label)
+
+    if target_stem:
+        if not anchor_part or anchor_is_chapter_entry:
+            # 目录里的章目链接应该精确跳到 EPUB 原锚点，而不是只打开文件。
+            if anchor_part:
+                return f"[[{target_stem}#^{anchor_bid}|{wiki_label}]]"
+            if target_entry_bids:
+                return f"[[{target_stem}#^{target_entry_bids[0]}|{wiki_label}]]"
+            if _compact_text(label) == _compact_text(target_title):
+                return f"[[{target_stem}]]"
+            return f"[[{target_stem}|{wiki_label}]]"
+        return f"[[{target_stem}#^{anchor_bid}|{wiki_label}]]"
+
+    if anchor_part and not file_part:
+        return f"[[#^{anchor_bid}|{wiki_label}]]"
+
+    return _compact_text(label)
+
+
 # ─────────────────────────────────────────────
 # ePub 读取与处理
 # ─────────────────────────────────────────────
@@ -563,12 +701,106 @@ def get_spine_items(book):
     return items
 
 
+def get_nav_items(book):
+    """返回 EPUB 自带目录文件（EPUB3 nav 或 EPUB2 ncx）。"""
+    nav_items = []
+    for item in book.get_items():
+        file_name = getattr(item, "file_name", "") or ""
+        media_type = getattr(item, "media_type", "") or ""
+        if item.get_type() == ebooklib.ITEM_NAVIGATION or file_name.lower().endswith(".ncx"):
+            nav_items.append(item)
+            continue
+        if item.get_type() == ebooklib.ITEM_DOCUMENT and media_type in ("application/xhtml+xml", "text/html"):
+            try:
+                html = item.get_content().decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            soup = BeautifulSoup(html, "html.parser")
+            if soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav", attrs={"type": "toc"}):
+                nav_items.append(item)
+    return nav_items
+
+
+def build_nav_markdown(book, link_map: dict, single_file: bool = False) -> str:
+    """优先使用 EPUB 自带目录生成 Obsidian 可点击目录。"""
+    parts = []
+    seen = set()
+    for item in get_nav_items(book):
+        item_path = _normalize_epub_path(item.file_name)
+        if item_path in seen:
+            continue
+        seen.add(item_path)
+        html = item.get_content().decode("utf-8", errors="replace")
+        md = nav_to_markdown(html, link_map=link_map, base_href=item_path, single_file=single_file)
+        md = _clean_md(md)
+        if md:
+            parts.append(md)
+    return "\n".join(parts).strip()
+
+
+def _collect_nav_entries_from_node(node, base_href: str = "") -> list:
+    """收集目录中的 href/title，用于用 EPUB 原目录标题修正占位章节名。"""
+    entries = []
+
+    nav_map = node.find("navmap")
+    if nav_map:
+        for nav_point in nav_map.find_all("navpoint"):
+            label = nav_point.find("text")
+            content = nav_point.find("content")
+            title = _nav_label_text(label) if label else ""
+            href = content.get("src", "") if content else ""
+            if href and title:
+                entries.append((href, title, base_href))
+
+    nav = node.find("nav", attrs={"epub:type": "toc"}) or node.find("nav", attrs={"type": "toc"}) or node.find("nav")
+    if nav:
+        for a in nav.find_all("a", href=True):
+            title = _nav_label_text(a)
+            if title:
+                entries.append((a.get("href", ""), title, base_href))
+
+    return entries
+
+
+def update_link_map_titles_from_nav(book, link_map: dict):
+    """当正文缺少标题导致文件名是 Chapter N 时，用 EPUB 目录标题修正 link_map。"""
+    updates = {}
+    for item in get_nav_items(book):
+        item_path = _normalize_epub_path(item.file_name)
+        html = item.get_content().decode("utf-8", errors="replace")
+        soup = BeautifulSoup(html, "html.parser")
+        for href, title, base_href in _collect_nav_entries_from_node(soup, item_path):
+            file_part = href.rsplit("#", 1)[0] if "#" in href else href
+            if not file_part:
+                continue
+            for cand in _href_candidates(file_part, base_href):
+                old_title = link_map.get(cand, "")
+                old_stem = _stem_from_link_map(link_map, cand)
+                if old_stem and (_is_placeholder_title(old_title) or _is_placeholder_title(old_stem.split(" - ", 1)[-1])):
+                    updates[old_stem] = title
+                    break
+
+    if not updates:
+        return
+
+    for key in list(link_map.keys()):
+        if key.endswith((":stem", ":heading_ids", ":sub_headings")):
+            continue
+        old_stem = _stem_from_link_map(link_map, key)
+        if old_stem in updates:
+            new_title = updates[old_stem]
+            prefix = old_stem.split(" - ", 1)[0] if " - " in old_stem else ""
+            new_stem = clean_filename(f"{prefix} - {new_title}" if prefix else new_title)
+            link_map[key] = new_title
+            link_map[key + ":stem"] = new_stem
+
+
 def infer_chapter_title(soup, index: int) -> str:
     """从 HTML 内容中推断章节标题。"""
     for h in ["h1", "h2", "h3", "title"]:
         tag = soup.find(h)
         if tag and tag.get_text(strip=True):
-            return tag.get_text(strip=True)
+            return _compact_text(tag.get_text(" ", strip=True))
     return f"Chapter {index + 1}"
 
 
@@ -616,17 +848,19 @@ def convert_epub(
 
     # 构建内部链接映射表
     link_map = build_link_map(items)
+    update_link_map_titles_from_nav(book, link_map)
+    nav_md = build_nav_markdown(book, link_map, single_file=single_file)
 
     if single_file:
-        _convert_single(book, items, meta, out_dir, book_title, no_frontmatter, extract_imgs, link_map)
+        _convert_single(book, items, meta, out_dir, book_title, no_frontmatter, extract_imgs, link_map, nav_md)
     else:
-        _convert_split(book, items, meta, out_dir, book_title, no_frontmatter, extract_imgs, link_map)
+        _convert_split(book, items, meta, out_dir, book_title, no_frontmatter, extract_imgs, link_map, nav_md)
 
     print(f"\n✅ 完成！输出目录: {out_dir}")
     return out_dir
 
 
-def _convert_single(book, items, meta, out_dir, book_title, no_frontmatter, extract_imgs, link_map):
+def _convert_single(book, items, meta, out_dir, book_title, no_frontmatter, extract_imgs, link_map, nav_md=""):
     """合并输出为单一 Markdown 文件。"""
     parts = []
 
@@ -634,11 +868,13 @@ def _convert_single(book, items, meta, out_dir, book_title, no_frontmatter, extr
         parts.append(make_frontmatter(meta))
 
     parts.append(f"# {book_title}\n\n")
+    if nav_md:
+        parts.append(f"## 目录\n\n{nav_md}\n\n---\n\n")
 
     first = True
     for i, item in enumerate(items):
         html = item.get_content().decode("utf-8", errors="replace")
-        current_file = os.path.basename(item.file_name)
+        current_file = _normalize_epub_path(item.file_name)
         md = html_to_markdown(html, image_dir=str(out_dir) if extract_imgs else None,
                               link_map=link_map, single_file=True,
                               base_href=current_file)
@@ -656,7 +892,7 @@ def _convert_single(book, items, meta, out_dir, book_title, no_frontmatter, extr
     print(f"   → {out_file.name}")
 
 
-def _convert_split(book, items, meta, out_dir, book_title, no_frontmatter, extract_imgs, link_map):
+def _convert_split(book, items, meta, out_dir, book_title, no_frontmatter, extract_imgs, link_map, nav_md=""):
     """按章节拆分输出。"""
     # 生成书籍索引文件
     index_lines = []
@@ -672,10 +908,13 @@ def _convert_split(book, items, meta, out_dir, book_title, no_frontmatter, extra
         html = item.get_content().decode("utf-8", errors="replace")
         soup = BeautifulSoup(html, "html.parser")
         chapter_title = infer_chapter_title(soup, i)
+        mapped_title = link_map.get(_normalize_epub_path(item.file_name), "")
+        if mapped_title and _is_placeholder_title(chapter_title):
+            chapter_title = mapped_title
 
         md = html_to_markdown(html, image_dir=str(out_dir) if extract_imgs else None,
                               link_map=link_map, single_file=False,
-                              base_href=os.path.basename(item.file_name))
+                              base_href=_normalize_epub_path(item.file_name))
         md = _clean_md(md)
 
         if not md or len(md.strip()) < 10:
@@ -707,10 +946,13 @@ def _convert_split(book, items, meta, out_dir, book_title, no_frontmatter, extra
         chapter_file.write_text("".join(chapter_content), encoding="utf-8")
         chapter_files.append((chapter_title, chapter_file.name))
 
-    # 写入索引
-    for title, filename in chapter_files:
-        stem = filename[:-3]  # 去掉 .md
-        index_lines.append(f"- [[{stem}|{title}]]\n")
+    # 写入索引：优先使用 EPUB 自带目录；没有目录时退回按章节生成。
+    if nav_md:
+        index_lines.append(nav_md + "\n")
+    else:
+        for title, filename in chapter_files:
+            stem = filename[:-3]  # 去掉 .md
+            index_lines.append(f"- [[{stem}|{_wiki_alias(title)}]]\n")
 
     index_file = out_dir / f"{clean_filename(book_title)}.md"
     index_file.write_text("".join(index_lines), encoding="utf-8")
@@ -735,7 +977,7 @@ def build_link_map(items) -> dict:
     link_map = {}
     used_names = {}
     for i, item in enumerate(items):
-        full_path = item.file_name
+        full_path = _normalize_epub_path(item.file_name)
         base_name_file = os.path.basename(full_path)
         html = item.get_content().decode("utf-8", errors="replace")
         soup = BeautifulSoup(html, "html.parser")
@@ -751,7 +993,7 @@ def build_link_map(items) -> dict:
         # 收集两种 id:
         # 1. entry_ids: 章节入口（第一个标题及其子孙的 id）→ 跳这些 id = 跳章节
         # 2. heading_id_to_text: 其他标题上的 id → 文字映射，跳这些 id = 跳小节标题
-        entry_ids = set()
+        entry_ids = []
         heading_id_to_text = {}  # id → heading text
 
         all_headings = soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
@@ -761,11 +1003,11 @@ def build_link_map(items) -> dict:
             if idx == 0:
                 # 第一个标题是章节入口
                 if hid:
-                    entry_ids.add(hid)
+                    entry_ids.append(hid)
                 for desc in h.find_all(id=True):
                     did = desc.get("id", "").strip()
                     if did:
-                        entry_ids.add(did)
+                        entry_ids.append(did)
             else:
                 # 后续标题是小节
                 if hid and htext:
@@ -781,10 +1023,19 @@ def build_link_map(items) -> dict:
             if isinstance(child, Tag):
                 cid = child.get("id", "").strip() if hasattr(child, "get") else ""
                 if cid:
-                    entry_ids.add(cid)
+                    entry_ids.append(cid)
+
+        entry_ids = _dedupe_preserve_order(entry_ids)
 
         # 注册多种 key 形式
-        keys = {full_path, base_name_file, unquote(full_path), unquote(base_name_file)}
+        keys = {
+            full_path,
+            base_name_file,
+            unquote(full_path),
+            unquote(base_name_file),
+            _normalize_epub_path(full_path),
+            _normalize_epub_path(base_name_file),
+        }
         for k in keys:
             if k:
                 link_map[k] = title
