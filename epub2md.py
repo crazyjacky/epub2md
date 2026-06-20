@@ -28,7 +28,9 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from bs4 import BeautifulSoup, NavigableString, Tag
+    from bs4 import BeautifulSoup, NavigableString, Tag, XMLParsedAsHTMLWarning
+    import warnings
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 except ImportError:
     print("请先安装: pip install beautifulsoup4")
     sys.exit(1)
@@ -131,6 +133,36 @@ def _get_heading_refs(node) -> list:
 def _compact_text(text: str) -> str:
     """把 HTML 中的换行、制表符、多空格折叠成适合作为链接别名的一行文本。"""
     return re.sub(r'\s+', ' ', text or '').strip()
+
+
+# 常见 EPUB 用于模拟列表的项目符号字符（未使用 <ul>/<li>）
+_BULLET_CHARS = frozenset("•·▪▸‣●◦○◆◇▷►➤➢")
+# 对应的子列表缩进级别（class 名含数字，如 list-hang2 → depth 1）
+_LIST_CLASS_RE = re.compile(r'(?:list[-_]?hang|list[-_]?bullet|list|bullet)[-_]?(\d+)', re.IGNORECASE)
+
+
+def _bullet_info(node) -> tuple:
+    """
+    检查元素内容是否以项目符号字符开头。
+    返回 (is_bullet: bool, depth: int, stripped_text: str)。
+    depth 从 CSS class 推断（list-hang1→0, list-hang2→1, …）。
+    """
+    text = (node.get_text() or "").lstrip()
+    if not text or text[0] not in _BULLET_CHARS:
+        return False, 0, ""
+    rest = text[1:].lstrip()
+    # 推断缩进层级
+    depth = 0
+    classes = node.get("class", [])
+    if isinstance(classes, str):
+        classes = [classes]
+    for cls in classes:
+        m = _LIST_CLASS_RE.search(cls)
+        if m:
+            level = int(m.group(1))
+            depth = max(0, level - 1)
+            break
+    return True, depth, rest
 
 
 def _visible_text_with_inline_spacing(node) -> str:
@@ -285,6 +317,10 @@ def _node_to_md(node, image_dir=None, base_href="", list_depth=0, ordered=False,
         inner = children_md().strip()
         if not inner and not block_refs:
             return ""
+        is_bullet, depth, bullet_text = _bullet_info(node)
+        if is_bullet:
+            indent = "  " * depth
+            return f"\n{indent}- {bullet_text}{block_refs}\n"
         return f"\n\n{inner}{block_refs}\n\n"
 
     # ── 换行 ──
@@ -477,6 +513,10 @@ def _node_to_md(node, image_dir=None, base_href="", list_depth=0, ordered=False,
         if tag in ("div", "section", "article", "main", "aside", "header", "footer", "figure"):
             inner = inner.strip()
             if inner:
+                is_bullet, depth, bullet_text = _bullet_info(node)
+                if is_bullet:
+                    indent = "  " * depth
+                    return f"\n{indent}- {bullet_text}{block_refs}\n"
                 return f"\n\n{inner}{block_refs}\n\n"
             elif block_refs:
                 # 空 div 但有锚点 → 生成占位段落以保留锚点
