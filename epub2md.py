@@ -137,6 +137,7 @@ def _compact_text(text: str) -> str:
 
 # 常见 EPUB 用于模拟列表的项目符号字符（未使用 <ul>/<li>）
 _BULLET_CHARS = frozenset("•·▪▸‣●◦○◆◇▷►➤➢")
+_BULLET_SPLIT_RE = re.compile(r'\s*[•·▪▸‣●◦○◆◇▷►➤➢]\s*')
 # 对应的子列表缩进级别（class 名含数字，如 list-hang2 → depth 1）
 _LIST_CLASS_RE = re.compile(r'(?:list[-_]?hang|list[-_]?bullet|list|bullet)[-_]?(\d+)', re.IGNORECASE)
 
@@ -163,6 +164,27 @@ def _bullet_info(node) -> tuple:
             depth = max(0, level - 1)
             break
     return True, depth, rest
+
+
+def _bullet_lines(inner_md: str, depth: int, block_refs: str) -> str:
+    """
+    把已渲染的 markdown 文本按中间的项目符号字符拆分成多个列表项。
+    用于双语 EPUB：同一 <div> 里英文 • ... 中文 • ... 的模式。
+    """
+    indent = "  " * depth
+    # 先去掉开头的 bullet（如果 children_md 带着渲染出来的 •）
+    stripped = inner_md.lstrip()
+    if stripped and stripped[0] in _BULLET_CHARS:
+        stripped = stripped[1:].lstrip()
+    # 按中间的 bullet 字符拆分成多段
+    parts = [p.strip() for p in _BULLET_SPLIT_RE.split(stripped) if p.strip()]
+    if not parts:
+        return ""
+    lines = [f"{indent}- {p}" for p in parts]
+    # block_refs 附加到最后一项
+    if block_refs:
+        lines[-1] += block_refs
+    return "\n" + "\n".join(lines) + "\n"
 
 
 def _visible_text_with_inline_spacing(node) -> str:
@@ -317,10 +339,9 @@ def _node_to_md(node, image_dir=None, base_href="", list_depth=0, ordered=False,
         inner = children_md().strip()
         if not inner and not block_refs:
             return ""
-        is_bullet, depth, bullet_text = _bullet_info(node)
+        is_bullet, depth, _ = _bullet_info(node)
         if is_bullet:
-            indent = "  " * depth
-            return f"\n{indent}- {bullet_text}{block_refs}\n"
+            return _bullet_lines(inner, depth, block_refs)
         return f"\n\n{inner}{block_refs}\n\n"
 
     # ── 换行 ──
@@ -513,10 +534,9 @@ def _node_to_md(node, image_dir=None, base_href="", list_depth=0, ordered=False,
         if tag in ("div", "section", "article", "main", "aside", "header", "footer", "figure"):
             inner = inner.strip()
             if inner:
-                is_bullet, depth, bullet_text = _bullet_info(node)
+                is_bullet, depth, _ = _bullet_info(node)
                 if is_bullet:
-                    indent = "  " * depth
-                    return f"\n{indent}- {bullet_text}{block_refs}\n"
+                    return _bullet_lines(inner, depth, block_refs)
                 return f"\n\n{inner}{block_refs}\n\n"
             elif block_refs:
                 # 空 div 但有锚点 → 生成占位段落以保留锚点
