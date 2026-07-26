@@ -13,6 +13,7 @@ epub2md.py — ePub to Markdown Converter for Obsidian
 import sys
 import os
 import re
+import json
 import argparse
 import zipfile
 import shutil
@@ -133,6 +134,11 @@ def _get_heading_refs(node) -> list:
 def _compact_text(text: str) -> str:
     """把 HTML 中的换行、制表符、多空格折叠成适合作为链接别名的一行文本。"""
     return re.sub(r'\s+', ' ', text or '').strip()
+
+
+def _strip_para_indent(text: str) -> str:
+    """移除每行开头用于模拟首行缩进的全角空格（U+3000），常见于中文 EPUB。"""
+    return re.sub(r'(?m)^　+', '', text)
 
 
 # 常见 EPUB 用于模拟列表的项目符号字符（未使用 <ul>/<li>）
@@ -336,7 +342,7 @@ def _node_to_md(node, image_dir=None, base_href="", list_depth=0, ordered=False,
 
     # ── 段落 ──
     if tag == "p":
-        inner = children_md().strip()
+        inner = _strip_para_indent(children_md()).strip()
         if not inner and not block_refs:
             return ""
         is_bullet, depth, _ = _bullet_info(node)
@@ -346,6 +352,15 @@ def _node_to_md(node, image_dir=None, base_href="", list_depth=0, ordered=False,
 
     # ── 换行 ──
     if tag == "br":
+        # 若父元素是段落/块级元素，且前后都有实质文字，用段落分隔（双语 EPUB 常见模式）
+        parent = node.parent
+        if parent and parent.name in ("p", "div", "li"):
+            siblings = list(parent.children)
+            br_idx = siblings.index(node)
+            before = "".join(str(s) for s in siblings[:br_idx]).strip()
+            after = "".join(str(s) for s in siblings[br_idx + 1:]).strip()
+            if before and after:
+                return "\n\n"
         return "  \n"
 
     # ── 水平线 ──
@@ -532,7 +547,7 @@ def _node_to_md(node, image_dir=None, base_href="", list_depth=0, ordered=False,
                "header", "footer", "nav", "span", "body"):
         inner = children_md()
         if tag in ("div", "section", "article", "main", "aside", "header", "footer", "figure"):
-            inner = inner.strip()
+            inner = _strip_para_indent(inner).strip()
             if inner:
                 is_bullet, depth, _ = _bullet_info(node)
                 if is_bullet:
@@ -1116,28 +1131,78 @@ def _clean_md(md: str) -> str:
 
 
 # ─────────────────────────────────────────────
+# 配置文件
+# ─────────────────────────────────────────────
+
+CONFIG_PATH = Path.home() / ".epub2md.json"
+_CONFIG_KEYS = {"output", "images"}
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(cfg: dict):
+    existing = load_config()
+    existing.update({k: v for k, v in cfg.items() if k in _CONFIG_KEYS})
+    CONFIG_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"✅ 已保存默认配置到 {CONFIG_PATH}")
+    for k, v in existing.items():
+        print(f"   {k}: {v}")
+
+
+# ─────────────────────────────────────────────
 # CLI 入口
 # ─────────────────────────────────────────────
 
 def main():
+    cfg = load_config()
+
     parser = argparse.ArgumentParser(
         description="ePub → Markdown 转换器（Obsidian 友好）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
-    parser.add_argument("epub", help="输入的 .epub 文件路径")
-    parser.add_argument("-o", "--output", help="输出目录（默认：epub 同目录下同名文件夹）")
+    parser.add_argument("epub", nargs="?", help="输入的 .epub 文件路径")
+    parser.add_argument("-o", "--output", help=f"输出目录（配置默认：{cfg.get('output', 'epub 同目录下同名文件夹')}）")
     parser.add_argument("--single", action="store_true", help="合并为单一 Markdown 文件")
-    parser.add_argument("--images", action="store_true", default=True, help="提取图片（默认开启）")
+    # 用 default=None 区分「用户显式传参」和「使用配置/内置默认」
+    parser.add_argument("--images", action="store_true", default=None, help="提取图片")
     parser.add_argument("--no-images", action="store_false", dest="images", help="不提取图片")
     parser.add_argument("--no-frontmatter", action="store_true", help="不生成 YAML frontmatter")
+    parser.add_argument("--save-defaults", action="store_true",
+                        help="把当前 -o / --images / --no-images 保存为默认配置")
 
     args = parser.parse_args()
+
+    # 处理 --save-defaults（可以不带 epub 单独运行）
+    if args.save_defaults:
+        to_save = {}
+        if args.output is not None:
+            to_save["output"] = args.output
+        if args.images is not None:
+            to_save["images"] = args.images
+        save_config(to_save)
+        if args.epub is None:
+            return
+
+    if args.epub is None:
+        parser.error("请提供 .epub 文件路径，或使用 --save-defaults 保存默认配置")
+
+    # CLI 参数 > 配置文件 > 内置默认
+    output_dir = args.output if args.output is not None else cfg.get("output")
+    extract_imgs = args.images if args.images is not None else cfg.get("images", True)
+
     convert_epub(
         epub_path=args.epub,
-        output_dir=args.output,
+        output_dir=output_dir,
         single_file=args.single,
-        extract_imgs=args.images,
+        extract_imgs=extract_imgs,
         no_frontmatter=args.no_frontmatter,
     )
 
